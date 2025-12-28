@@ -1,4 +1,4 @@
-# Hand Gesture Media Controller 🖐️
+# Hand Gesture Media Controller
 
 Control your Mac's volume and media playback using hand gestures detected via your webcam. Built with MediaPipe hand landmark detection.
 

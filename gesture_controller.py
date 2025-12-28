@@ -7,6 +7,7 @@ Gestures:
 - 2 Fingers Up (index + middle): Control volume by moving up/down
 - Fist: Pause media
 - Thumbs up: Play media
+- Face Detection: Auto-pauses when face leaves frame (after 2 seconds)
 """
 
 import cv2
@@ -28,6 +29,13 @@ class GestureController:
             min_tracking_confidence=0.7
         )
         
+        # Face detection setup
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            min_detection_confidence=0.5,
+            model_selection=0  # 0 for short-range (2 meters), 1 for full-range (5 meters)
+        )
+        
         # Gesture state tracking
         self.last_volume_update = 0
         self.volume_cooldown = 0.1  # seconds between volume updates
@@ -37,12 +45,26 @@ class GestureController:
         self.thumbs_up_hold_duration = 0.3  # How long to hold thumbs up for play
         self.last_play_action = 0
         self.play_cooldown = 1.0  # Cooldown after play action
+        self.thumbs_up_triggered = False  # Track if action already triggered
+        self.thumbs_up_was_active = False  # Track previous state
         
         # Fist detection
         self.fist_start_time = None
         self.fist_hold_duration = 0.3  # How long to hold fist for pause
         self.last_pause_action = 0
         self.pause_cooldown = 1.0
+        self.fist_triggered = False  # Track if action already triggered
+        self.fist_was_active = False  # Track previous state
+        
+        # Media state tracking (to avoid unwanted toggles)
+        self.media_is_playing = None  # None = unknown, True = playing, False = paused
+        
+        # Face tracking for auto-pause
+        self.face_detected = False
+        self.face_last_seen = time.time()
+        self.face_absence_duration = 0.0
+        self.auto_pause_threshold = 2.0  # Pause after 2 seconds of no face
+        self.auto_pause_triggered = False  # Track if we already auto-paused
         
         # Visual feedback
         self.current_gesture = "None"
@@ -67,20 +89,164 @@ class GestureController:
             capture_output=True
         )
         self.current_volume = level
+    
+    def _is_youtube_open(self):
+        """Check if YouTube is open in Chrome or Safari."""
+        try:
+            # Check Chrome
+            result = subprocess.run(
+                ["osascript", "-e", '''
+                tell application "System Events"
+                    set chromeRunning to (name of processes) contains "Google Chrome"
+                end tell
+                if chromeRunning then
+                    tell application "Google Chrome"
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                if URL of t contains "youtube.com" then
+                                    return "chrome"
+                                end if
+                            end repeat
+                        end repeat
+                    end tell
+                end if
+                return "none"
+                '''],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if "chrome" in result.stdout.lower():
+                return "chrome"
+        except:
+            pass
+        
+        try:
+            # Check Safari
+            result = subprocess.run(
+                ["osascript", "-e", '''
+                tell application "System Events"
+                    set safariRunning to (name of processes) contains "Safari"
+                end tell
+                if safariRunning then
+                    tell application "Safari"
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                if URL of t contains "youtube.com" then
+                                    return "safari"
+                                end if
+                            end repeat
+                        end repeat
+                    end tell
+                end if
+                return "none"
+                '''],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if "safari" in result.stdout.lower():
+                return "safari"
+        except:
+            pass
+        
+        return None
+    
+    def _control_youtube(self, action):
+        """Control YouTube video directly using JavaScript.
+        
+        Args:
+            action: 'play' or 'pause'
+        """
+        browser = self._is_youtube_open()
+        
+        if browser == "chrome":
+            try:
+                script = f'''
+                tell application "Google Chrome"
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            if URL of t contains "youtube.com" then
+                                try
+                                    execute t javascript "if(document.querySelector('video')) {{ document.querySelector('video').{action}(); }}"
+                                    return true
+                                end try
+                            end if
+                        end repeat
+                    end repeat
+                end tell
+                return false
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                return "true" in result.stdout.lower()
+            except Exception:
+                return False
+        
+        elif browser == "safari":
+            try:
+                script = f'''
+                tell application "Safari"
+                    repeat with w in windows
+                        repeat with t in tabs of w
+                            if URL of t contains "youtube.com" then
+                                try
+                                    do JavaScript "if(document.querySelector('video')) {{ document.querySelector('video').{action}(); }}" in t
+                                    return true
+                                end try
+                            end if
+                        end repeat
+                    end repeat
+                end tell
+                return false
+                '''
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                return "true" in result.stdout.lower()
+            except Exception:
+                return False
+        
+        return False
         
     def play_media(self):
-        """Send play command using space key (media play/pause toggle)."""
-        subprocess.run([
-            "osascript", "-e",
-            'tell application "System Events" to keystroke space'
-        ], capture_output=True)
+        """Send play command - tries YouTube first, then falls back to space key."""
+        # Only send play if we know media is paused, or if state is unknown
+        if self.media_is_playing is False or self.media_is_playing is None:
+            # Try YouTube-specific control first
+            if self._control_youtube("play"):
+                self.media_is_playing = True
+                return
+            
+            # Fallback to space bar
+            subprocess.run([
+                "osascript", "-e",
+                'tell application "System Events" to keystroke space'
+            ], capture_output=True)
+            self.media_is_playing = True
         
     def pause_media(self):
-        """Send pause command."""
-        subprocess.run([
-            "osascript", "-e",
-            'tell application "System Events" to keystroke space'
-        ], capture_output=True)
+        """Send pause command - tries YouTube first, then falls back to space key."""
+        # Only send pause if we know media is playing, or if state is unknown
+        if self.media_is_playing is True or self.media_is_playing is None:
+            # Try YouTube-specific control first
+            if self._control_youtube("pause"):
+                self.media_is_playing = False
+                return
+            
+            # Fallback to space bar
+            subprocess.run([
+                "osascript", "-e",
+                'tell application "System Events" to keystroke space'
+            ], capture_output=True)
+            self.media_is_playing = False
         
     def calculate_distance(self, p1, p2):
         """Calculate Euclidean distance between two landmarks."""
@@ -171,6 +337,29 @@ class GestureController:
         
         # Convert to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Detect face for auto-pause feature
+        face_results = self.face_detection.process(rgb_frame)
+        if face_results.detections:
+            self.face_detected = True
+            self.face_last_seen = current_time
+            self.face_absence_duration = 0.0
+            self.auto_pause_triggered = False  # Reset when face returns
+        else:
+            self.face_detected = False
+            self.face_absence_duration = current_time - self.face_last_seen
+            
+            # Auto-pause if face has been absent for threshold duration
+            # Trigger if playing OR unknown (user likely watching without using gestures)
+            # Only skip if we explicitly know media is paused
+            if (self.face_absence_duration > self.auto_pause_threshold and 
+                not self.auto_pause_triggered and 
+                self.media_is_playing is not False):
+                print(f"🤖 Auto-pausing: Face absent for {self.face_absence_duration:.1f}s")
+                self.pause_media()
+                self.auto_pause_triggered = True
+        
+        # Process hand gestures
         results = self.hands.process(rgb_frame)
         
         gesture_text = "No hand detected"
@@ -187,36 +376,65 @@ class GestureController:
                 landmarks = hand_landmarks.landmark
                 
                 # Check for thumbs up gesture (PLAY)
-                if self.is_thumbs_up(landmarks):
-                    if self.thumbs_up_start_time is None:
+                thumbs_up_active = self.is_thumbs_up(landmarks)
+                fist_active = False  # Initialize to avoid UnboundLocalError
+                
+                if thumbs_up_active:
+                    # Gesture just appeared (wasn't active before)
+                    if not self.thumbs_up_was_active:
                         self.thumbs_up_start_time = current_time
-                    elif (current_time - self.thumbs_up_start_time > self.thumbs_up_hold_duration and
-                          current_time - self.last_play_action > self.play_cooldown):
+                        self.thumbs_up_triggered = False
+                    
+                    # Check if we should trigger play
+                    if (not self.thumbs_up_triggered and
+                        current_time - self.thumbs_up_start_time > self.thumbs_up_hold_duration and
+                        current_time - self.last_play_action > self.play_cooldown):
                         self.play_media()
                         self.last_play_action = current_time
+                        self.thumbs_up_triggered = True
                         gesture_text = "👍 PLAY!"
                         self.current_gesture = "Thumbs Up - Play"
-                    else:
+                    elif not self.thumbs_up_triggered:
                         gesture_text = f"👍 Hold thumbs up to play..."
                         self.current_gesture = "Thumbs Up detected"
+                    else:
+                        gesture_text = "👍 Playing..."
+                        self.current_gesture = "Thumbs Up - Active"
                 else:
-                    self.thumbs_up_start_time = None
+                    # Gesture released - reset state
+                    if self.thumbs_up_was_active:
+                        self.thumbs_up_start_time = None
+                        self.thumbs_up_triggered = False
                     
                     # Check for fist gesture (PAUSE)
-                    if self.is_fist(landmarks):
-                        if self.fist_start_time is None:
+                    fist_active = self.is_fist(landmarks)
+                    
+                    if fist_active:
+                        # Gesture just appeared (wasn't active before)
+                        if not self.fist_was_active:
                             self.fist_start_time = current_time
-                        elif (current_time - self.fist_start_time > self.fist_hold_duration and
-                              current_time - self.last_pause_action > self.pause_cooldown):
+                            self.fist_triggered = False
+                        
+                        # Check if we should trigger pause
+                        if (not self.fist_triggered and
+                            current_time - self.fist_start_time > self.fist_hold_duration and
+                            current_time - self.last_pause_action > self.pause_cooldown):
                             self.pause_media()
                             self.last_pause_action = current_time
+                            self.fist_triggered = True
                             gesture_text = "✋ PAUSED"
                             self.current_gesture = "Fist - Paused"
-                        else:
+                        elif not self.fist_triggered:
                             gesture_text = f"✊ Hold fist to pause..."
                             self.current_gesture = "Fist detected"
+                        else:
+                            gesture_text = "✊ Paused..."
+                            self.current_gesture = "Fist - Active"
                     else:
-                        self.fist_start_time = None
+                        # Gesture released - reset state
+                        if self.fist_was_active:
+                            self.fist_start_time = None
+                            self.fist_triggered = False
                         
                         # Check for 2-finger gesture (VOLUME)
                         if self.is_two_fingers_up(landmarks):
@@ -230,24 +448,70 @@ class GestureController:
                             
                             if current_time - self.last_volume_update > self.volume_cooldown:
                                 # Map Y position to volume (top = 100, bottom = 0)
-                                target_volume = int((1 - hand_y) * 100)
+                                # Use a more sensitive range for better control
+                                # Normalize to 0.1-0.9 range to avoid edge cases
+                                normalized_y = max(0.1, min(0.9, hand_y))
+                                target_volume = int((1 - normalized_y) * 100)
                                 target_volume = max(0, min(100, target_volume))
                                 
-                                # Smooth volume change
+                                # More responsive volume change, especially for decrease
                                 diff = target_volume - self.current_volume
-                                if abs(diff) > 2:
-                                    new_volume = self.current_volume + (diff // 3)
+                                if abs(diff) > 1:  # Lower threshold for more sensitivity
+                                    # Use larger step size for faster response
+                                    step = max(1, abs(diff) // 2)
+                                    if diff > 0:
+                                        new_volume = min(100, self.current_volume + step)
+                                    else:
+                                        new_volume = max(0, self.current_volume - step)
                                     self.set_volume(new_volume)
                                     self.last_volume_update = current_time
                                     
                         else:
                             gesture_text = f"👋 Open hand - 2 Fingers Up to control volume"
                             self.current_gesture = "Open Hand"
+                
+                # Update previous state for next frame
+                self.thumbs_up_was_active = thumbs_up_active
+                self.fist_was_active = fist_active
+        
+        # Draw face detection indicator
+        self.draw_face_indicator(frame)
         
         # Draw UI overlay
         self.draw_overlay(frame, gesture_text)
         
         return frame
+    
+    def draw_face_indicator(self, frame):
+        """Draw face detection status indicator."""
+        h, w = frame.shape[:2]
+        
+        # Face indicator in top-right corner
+        indicator_x = w - 150
+        indicator_y = 20
+        
+        if self.face_detected:
+            # Green indicator - face detected
+            cv2.circle(frame, (indicator_x + 10, indicator_y + 10), 8, (0, 255, 0), -1)
+            cv2.putText(frame, "Face", (indicator_x + 25, indicator_y + 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        else:
+            # Red indicator - no face
+            cv2.circle(frame, (indicator_x + 10, indicator_y + 10), 8, (0, 0, 255), -1)
+            cv2.putText(frame, "No Face", (indicator_x + 25, indicator_y + 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            
+            # Show countdown if face is absent
+            if self.face_absence_duration > 0:
+                remaining = max(0, self.auto_pause_threshold - self.face_absence_duration)
+                if remaining > 0 and not self.auto_pause_triggered:
+                    cv2.putText(frame, f"Auto-pause in: {remaining:.1f}s", 
+                               (indicator_x, indicator_y + 35),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+                elif self.auto_pause_triggered:
+                    cv2.putText(frame, "Auto-paused", 
+                               (indicator_x, indicator_y + 35),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
     
     def draw_overlay(self, frame, gesture_text):
         """Draw status overlay on frame."""
@@ -297,6 +561,7 @@ class GestureController:
         print("  ✌️  2 Fingers Up + Move Up/Down → Volume control")
         print("  ✊ Fist (hold)                  → Pause")
         print("  👍 Thumbs Up (hold)            → Play")
+        print("  👤 Face Detection              → Auto-pause when you leave")
         print("━" * 40)
         print("Press 'Q' in the window to quit")
         

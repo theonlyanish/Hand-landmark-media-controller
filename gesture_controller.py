@@ -5,7 +5,7 @@ Uses MediaPipe hand landmarks to control volume and media playback.
 
 Gestures:
 - 2 Fingers Up (index + middle): Control volume by moving up/down
-- Fist: Pause media
+- Open Palm (stop sign): Pause media
 - Thumbs up: Play media
 - Face Detection: Auto-pauses when face leaves frame (after 2 seconds)
 """
@@ -39,6 +39,8 @@ class GestureController:
         # Gesture state tracking
         self.last_volume_update = 0
         self.volume_cooldown = 0.1  # seconds between volume updates
+        self.volume_sync_interval = 0.4  # seconds between system volume polls
+        self.last_volume_sync = 0
         
         # Thumbs up detection
         self.thumbs_up_start_time = None
@@ -48,13 +50,13 @@ class GestureController:
         self.thumbs_up_triggered = False  # Track if action already triggered
         self.thumbs_up_was_active = False  # Track previous state
         
-        # Fist detection
-        self.fist_start_time = None
-        self.fist_hold_duration = 0.3  # How long to hold fist for pause
+        # Open palm (stop sign) detection for pause
+        self.open_palm_start_time = None
+        self.open_palm_hold_duration = 0.5  # How long to hold open palm for pause
         self.last_pause_action = 0
         self.pause_cooldown = 1.0
-        self.fist_triggered = False  # Track if action already triggered
-        self.fist_was_active = False  # Track previous state
+        self.open_palm_triggered = False  # Track if action already triggered
+        self.open_palm_was_active = False  # Track previous state
         
         # Media state tracking (to avoid unwanted toggles)
         self.media_is_playing = None  # None = unknown, True = playing, False = paused
@@ -69,26 +71,45 @@ class GestureController:
         # Visual feedback
         self.current_gesture = "None"
         self.current_volume = self.get_current_volume()
+        self.last_volume_sync = time.time()
         
     def get_current_volume(self):
         """Get current Mac volume level (0-100)."""
         try:
             result = subprocess.run(
                 ["osascript", "-e", "output volume of (get volume settings)"],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=1
             )
-            return int(result.stdout.strip())
-        except:
+            if result.returncode != 0:
+                return self.current_volume if hasattr(self, "current_volume") else 50
+            return max(0, min(100, int(result.stdout.strip())))
+        except Exception:
             return 50
     
     def set_volume(self, level):
         """Set Mac volume (0-100)."""
         level = max(0, min(100, level))
-        subprocess.run(
-            ["osascript", "-e", f"set volume output volume {level}"],
-            capture_output=True
-        )
-        self.current_volume = level
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", f"set volume output volume {level}"],
+                capture_output=True,
+                timeout=1
+            )
+            if result.returncode == 0:
+                self.current_volume = level
+                self.last_volume_sync = time.time()
+        except Exception:
+            pass
+
+    def sync_volume_from_system(self, current_time, force=False):
+        """Refresh cached volume so UI tracks external system volume changes."""
+        if not force and current_time - self.last_volume_sync < self.volume_sync_interval:
+            return
+
+        system_volume = self.get_current_volume()
+        if system_volume != self.current_volume:
+            self.current_volume = system_volume
+        self.last_volume_sync = current_time
     
     def _is_youtube_open(self):
         """Check if YouTube is open in Chrome or Safari."""
@@ -252,29 +273,47 @@ class GestureController:
         """Calculate Euclidean distance between two landmarks."""
         return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
     
-    def is_fist(self, landmarks):
-        """Detect if hand is making a fist."""
-        # Finger tip landmarks
-        tips = [8, 12, 16, 20]  # Index, middle, ring, pinky tips
-        # Finger MCP (knuckle) landmarks
+    def is_open_palm(self, landmarks):
+        """Detect open palm (stop sign gesture) - all 5 fingers extended and spread.
+        
+        This is unambiguous and intuitive for 'stop/pause'.
+        """
+        # Check all 4 main fingers are extended (tip above PIP and MCP)
+        # Finger tips: 8 (index), 12 (middle), 16 (ring), 20 (pinky)
+        # Finger PIPs: 6, 10, 14, 18
+        # Finger MCPs: 5, 9, 13, 17
+        
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
         mcps = [5, 9, 13, 17]
         
-        fist_count = 0
-        for tip, mcp in zip(tips, mcps):
-            # If fingertip is below MCP (closer to wrist), finger is curled
-            if landmarks[tip].y > landmarks[mcp].y:
-                fist_count += 1
+        extended_count = 0
+        for tip, pip, mcp in zip(tips, pips, mcps):
+            # Finger is extended if tip is above (lower y) both PIP and MCP
+            if landmarks[tip].y < landmarks[pip].y and landmarks[tip].y < landmarks[mcp].y:
+                extended_count += 1
         
-        # Check thumb separately (using x coordinate)
+        # Check thumb is extended (tip away from palm)
         thumb_tip = landmarks[4]
+        thumb_ip = landmarks[3]
         thumb_mcp = landmarks[2]
-        # Thumb curled if tip is close to palm
-        palm_center = landmarks[9]
-        thumb_dist = self.calculate_distance(thumb_tip, palm_center)
-        if thumb_dist < 0.1:
-            fist_count += 1
-            
-        return fist_count >= 4
+        wrist = landmarks[0]
+        
+        # Thumb extended if tip is further from wrist than MCP
+        thumb_tip_dist = self.calculate_distance(thumb_tip, wrist)
+        thumb_mcp_dist = self.calculate_distance(thumb_mcp, wrist)
+        thumb_extended = thumb_tip_dist > thumb_mcp_dist
+        
+        # Check fingers are spread (not bunched together)
+        # Distance between index tip and pinky tip should be significant
+        index_tip = landmarks[8]
+        pinky_tip = landmarks[20]
+        finger_spread = abs(index_tip.x - pinky_tip.x)
+        
+        # Open palm: all 4 fingers extended + thumb extended + fingers spread
+        is_open = (extended_count >= 4 and thumb_extended and finger_spread > 0.1)
+        
+        return is_open
     
     def is_two_fingers_up(self, landmarks):
         """Detect if index and middle fingers are extended (2-finger gesture)."""
@@ -334,6 +373,7 @@ class GestureController:
     def process_frame(self, frame):
         """Process a frame and handle gestures."""
         current_time = time.time()
+        self.sync_volume_from_system(current_time)
         
         # Convert to RGB for MediaPipe
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -377,7 +417,7 @@ class GestureController:
                 
                 # Check for thumbs up gesture (PLAY)
                 thumbs_up_active = self.is_thumbs_up(landmarks)
-                fist_active = False  # Initialize to avoid UnboundLocalError
+                open_palm_active = False  # Initialize to avoid UnboundLocalError
                 
                 if thumbs_up_active:
                     # Gesture just appeared (wasn't active before)
@@ -406,59 +446,61 @@ class GestureController:
                         self.thumbs_up_start_time = None
                         self.thumbs_up_triggered = False
                     
-                    # Check for fist gesture (PAUSE)
-                    fist_active = self.is_fist(landmarks)
+                    # Check for open palm gesture (PAUSE) - stop sign
+                    open_palm_active = self.is_open_palm(landmarks)
                     
-                    if fist_active:
+                    if open_palm_active:
                         # Gesture just appeared (wasn't active before)
-                        if not self.fist_was_active:
-                            self.fist_start_time = current_time
-                            self.fist_triggered = False
+                        if not self.open_palm_was_active:
+                            self.open_palm_start_time = current_time
+                            self.open_palm_triggered = False
                         
                         # Check if we should trigger pause
-                        if (not self.fist_triggered and
-                            current_time - self.fist_start_time > self.fist_hold_duration and
+                        if (not self.open_palm_triggered and
+                            current_time - self.open_palm_start_time > self.open_palm_hold_duration and
                             current_time - self.last_pause_action > self.pause_cooldown):
                             self.pause_media()
                             self.last_pause_action = current_time
-                            self.fist_triggered = True
-                            gesture_text = "✋ PAUSED"
-                            self.current_gesture = "Fist - Paused"
-                        elif not self.fist_triggered:
-                            gesture_text = f"✊ Hold fist to pause..."
-                            self.current_gesture = "Fist detected"
+                            self.open_palm_triggered = True
+                            gesture_text = "🖐️ PAUSED"
+                            self.current_gesture = "Open Palm - Paused"
+                        elif not self.open_palm_triggered:
+                            gesture_text = f"🖐️ Hold open palm to pause..."
+                            self.current_gesture = "Open Palm detected"
                         else:
-                            gesture_text = "✊ Paused..."
-                            self.current_gesture = "Fist - Active"
+                            gesture_text = "🖐️ Paused..."
+                            self.current_gesture = "Open Palm - Active"
                     else:
                         # Gesture released - reset state
-                        if self.fist_was_active:
-                            self.fist_start_time = None
-                            self.fist_triggered = False
+                        if self.open_palm_was_active:
+                            self.open_palm_start_time = None
+                            self.open_palm_triggered = False
                         
                         # Check for 2-finger gesture (VOLUME)
                         if self.is_two_fingers_up(landmarks):
-                            gesture_text = "✌️ 2 Fingers - move up/down for volume"
-                            self.current_gesture = "2 Fingers Up"
-                            
                             # Use average Y position of index and middle finger tips for volume control
                             index_y = landmarks[8].y  # Index finger tip Y
                             middle_y = landmarks[12].y  # Middle finger tip Y
                             hand_y = (index_y + middle_y) / 2  # Average Y position
                             
+                            # Map screen Y (0-1) directly to volume (0-100)
+                            # Y=0 is top of screen → volume 100
+                            # Y=1 is bottom of screen → volume 0
+                            # Use full range: clamp Y to 0.05-0.95 then scale to 0-100
+                            clamped_y = max(0.05, min(0.95, hand_y))
+                            # Scale 0.05-0.95 range to 0-100
+                            target_volume = int(((0.95 - clamped_y) / 0.9) * 100)
+                            target_volume = max(0, min(100, target_volume))
+                            
+                            gesture_text = f"✌️ Volume: {target_volume}%"
+                            self.current_gesture = "2 Fingers Up"
+                            
                             if current_time - self.last_volume_update > self.volume_cooldown:
-                                # Map Y position to volume (top = 100, bottom = 0)
-                                # Use a more sensitive range for better control
-                                # Normalize to 0.1-0.9 range to avoid edge cases
-                                normalized_y = max(0.1, min(0.9, hand_y))
-                                target_volume = int((1 - normalized_y) * 100)
-                                target_volume = max(0, min(100, target_volume))
-                                
-                                # More responsive volume change, especially for decrease
+                                # Directly set to target volume for immediate response
                                 diff = target_volume - self.current_volume
-                                if abs(diff) > 1:  # Lower threshold for more sensitivity
-                                    # Use larger step size for faster response
-                                    step = max(1, abs(diff) // 2)
+                                if abs(diff) > 1:
+                                    # Move quickly towards target
+                                    step = max(2, abs(diff) // 2)
                                     if diff > 0:
                                         new_volume = min(100, self.current_volume + step)
                                     else:
@@ -472,7 +514,7 @@ class GestureController:
                 
                 # Update previous state for next frame
                 self.thumbs_up_was_active = thumbs_up_active
-                self.fist_was_active = fist_active
+                self.open_palm_was_active = open_palm_active
         
         # Draw face detection indicator
         self.draw_face_indicator(frame)
@@ -541,7 +583,7 @@ class GestureController:
         
         # Instructions at bottom
         instructions = [
-            "Controls: 2 Fingers Up + Move = Volume | Fist = Pause | Thumbs Up = Play",
+            "Controls: 2 Fingers = Volume | Open Palm = Pause | Thumbs Up = Play",
             "Press 'Q' to quit"
         ]
         for i, text in enumerate(instructions):
@@ -559,7 +601,7 @@ class GestureController:
         print("━" * 40)
         print("Controls:")
         print("  ✌️  2 Fingers Up + Move Up/Down → Volume control")
-        print("  ✊ Fist (hold)                  → Pause")
+        print("  🖐️  Open Palm (stop sign)       → Pause")
         print("  👍 Thumbs Up (hold)            → Play")
         print("  👤 Face Detection              → Auto-pause when you leave")
         print("━" * 40)
@@ -594,4 +636,3 @@ class GestureController:
 if __name__ == "__main__":
     controller = GestureController()
     controller.run()
-

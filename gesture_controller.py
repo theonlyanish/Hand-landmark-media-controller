@@ -4,7 +4,8 @@ Hand Gesture Media Controller for Mac
 Uses MediaPipe hand landmarks to control volume and media playback.
 
 Gestures:
-- 2 Fingers Up (index + middle): Control volume by moving up/down
+- 2 Fingers Up (index + middle): Volume control by hand height
+- Index Finger Down / Hand Down (bottom 20%): Volume down
 - Open Palm (stop sign) or Fist: Pause media
 - Thumbs up: Play media
 - Face Detection: Auto-pauses when face leaves frame (after 2 seconds)
@@ -394,6 +395,54 @@ class GestureController:
 
         return fingers_curled >= 4 and thumb_tucked
 
+    def is_index_finger_down(self, landmarks):
+        """Detect index finger pointing down (like the backhand index pointing down emoji).
+
+        Index finger is extended downward while other fingers are curled.
+        """
+        index_tip = landmarks[8]
+        index_pip = landmarks[6]
+        index_mcp = landmarks[5]
+
+        # Index clearly pointing down: tip well below PIP, PIP below MCP
+        index_down = (index_tip.y > index_pip.y + 0.04 and
+                      index_pip.y > index_mcp.y)
+
+        # Other fingers should NOT be extended downward
+        other_tips = [12, 16, 20]
+        other_pips = [10, 14, 18]
+        others_not_down = 0
+        for tip, pip in zip(other_tips, other_pips):
+            if not (landmarks[tip].y > landmarks[pip].y + 0.04):
+                others_not_down += 1
+
+        return index_down and others_not_down >= 2
+
+    def is_hand_facing_down(self, landmarks):
+        """Detect hand facing/pointing downward with fingers extended.
+
+        Fingertips are below the wrist and fingers are spread out (not a fist).
+        """
+        wrist = landmarks[0]
+
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
+
+        # Most fingertips below the wrist (hand oriented downward)
+        tips_below_wrist = sum(1 for t in tips if landmarks[t].y > wrist.y)
+
+        # Fingers are extended (tip significantly away from PIP, not curled)
+        fingers_extended = 0
+        for tip, pip in zip(tips, pips):
+            dist = abs(landmarks[tip].y - landmarks[pip].y)
+            if dist > 0.03:
+                fingers_extended += 1
+
+        # Thumb tip also below wrist for a full downward orientation
+        thumb_below = landmarks[4].y > wrist.y
+
+        return tips_below_wrist >= 3 and fingers_extended >= 3 and thumb_below
+
     def process_frame(self, frame):
         """Process a frame and handle gestures."""
         current_time = time.time()
@@ -505,17 +554,11 @@ class GestureController:
                         
                         # Check for 2-finger gesture (VOLUME)
                         if self.is_two_fingers_up(landmarks):
-                            # Use average Y position of index and middle finger tips for volume control
-                            index_y = landmarks[8].y  # Index finger tip Y
-                            middle_y = landmarks[12].y  # Middle finger tip Y
-                            hand_y = (index_y + middle_y) / 2  # Average Y position
-                            
-                            # Map screen Y (0-1) directly to volume (0-100)
-                            # Y=0 is top of screen → volume 100
-                            # Y=1 is bottom of screen → volume 0
-                            # Use full range: clamp Y to 0.05-0.95 then scale to 0-100
+                            index_y = landmarks[8].y
+                            middle_y = landmarks[12].y
+                            hand_y = (index_y + middle_y) / 2
+
                             clamped_y = max(0.05, min(0.95, hand_y))
-                            # Scale 0.05-0.95 range to 0-100
                             target_volume = int(((0.95 - clamped_y) / 0.9) * 100)
                             target_volume = max(0, min(100, target_volume))
                             
@@ -523,10 +566,8 @@ class GestureController:
                             self.current_gesture = "2 Fingers Up"
                             
                             if current_time - self.last_volume_update > self.volume_cooldown:
-                                # Directly set to target volume for immediate response
                                 diff = target_volume - self.current_volume
                                 if abs(diff) > 1:
-                                    # Move quickly towards target
                                     step = max(2, abs(diff) // 2)
                                     if diff > 0:
                                         new_volume = min(100, self.current_volume + step)
@@ -534,7 +575,32 @@ class GestureController:
                                         new_volume = max(0, self.current_volume - step)
                                     self.set_volume(new_volume)
                                     self.last_volume_update = current_time
-                                    
+
+                        # Volume DOWN: index finger pointing down
+                        elif self.is_index_finger_down(landmarks):
+                            gesture_text = f"Vol Down: {self.current_volume}%"
+                            self.current_gesture = "Index Finger Down"
+                            if (current_time - self.last_volume_update > self.volume_cooldown
+                                    and self.current_volume > 0):
+                                new_volume = max(0, self.current_volume - 2)
+                                self.set_volume(new_volume)
+                                self.last_volume_update = current_time
+
+                        # Volume DOWN: hand facing down in bottom 20% of frame
+                        elif self.is_hand_facing_down(landmarks):
+                            wrist_y = landmarks[0].y
+                            if wrist_y > 0.60:
+                                gesture_text = f"Vol Down: {self.current_volume}%"
+                                self.current_gesture = "Hand Down"
+                                if (current_time - self.last_volume_update > self.volume_cooldown
+                                        and self.current_volume > 0):
+                                    new_volume = max(0, self.current_volume - 2)
+                                    self.set_volume(new_volume)
+                                    self.last_volume_update = current_time
+                            else:
+                                gesture_text = "Move hand lower to decrease vol"
+                                self.current_gesture = "Hand Down (too high)"
+
                         else:
                             gesture_text = "Hand open - show 2 fingers for vol"
                             self.current_gesture = "Open Hand"
@@ -610,7 +676,7 @@ class GestureController:
         
         # Instructions at bottom with dark background for readability
         instructions = [
-            "2 Fingers = Volume | Palm/Fist = Pause | Thumbs Up = Play",
+            "2 Fingers=Vol | Finger/Hand Down=Vol- | Palm/Fist=Pause | Thumbs Up=Play",
             "Press 'Q' to quit"
         ]
         bar_overlay = frame.copy()
@@ -631,6 +697,8 @@ class GestureController:
         print("-" * 40)
         print("Controls:")
         print("  2 Fingers Up + Move Up/Down -> Volume control")
+        print("  Index Finger Down           -> Volume down")
+        print("  Hand Down (bottom of frame) -> Volume down")
         print("  Open Palm / Fist            -> Pause")
         print("  Thumbs Up (hold)            -> Play")
         print("  Face Detection              -> Auto-pause when you leave")

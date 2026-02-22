@@ -5,7 +5,7 @@ Uses MediaPipe hand landmarks to control volume and media playback.
 
 Gestures:
 - 2 Fingers Up (index + middle): Control volume by moving up/down
-- Open Palm (stop sign): Pause media
+- Open Palm (stop sign) or Fist: Pause media
 - Thumbs up: Play media
 - Face Detection: Auto-pauses when face leaves frame (after 2 seconds)
 """
@@ -370,6 +370,30 @@ class GestureController:
         # Thumbs up: thumb extended AND at least 3 other fingers closed
         return thumb_extended and fingers_closed >= 3
     
+    def is_fist(self, landmarks):
+        """Detect a closed fist (front or back of hand).
+
+        All four fingers curled (tips below PIP joints) and thumb tucked
+        (tip closer to palm center than thumb MCP is).
+        """
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
+
+        fingers_curled = 0
+        for tip, pip in zip(tips, pips):
+            if landmarks[tip].y > landmarks[pip].y:
+                fingers_curled += 1
+
+        thumb_tip = landmarks[4]
+        thumb_mcp = landmarks[2]
+        palm_center = landmarks[9]
+
+        thumb_tip_dist = self.calculate_distance(thumb_tip, palm_center)
+        thumb_mcp_dist = self.calculate_distance(thumb_mcp, palm_center)
+        thumb_tucked = thumb_tip_dist < thumb_mcp_dist * 1.3
+
+        return fingers_curled >= 4 and thumb_tucked
+
     def process_frame(self, frame):
         """Process a frame and handle gestures."""
         current_time = time.time()
@@ -395,7 +419,7 @@ class GestureController:
             if (self.face_absence_duration > self.auto_pause_threshold and 
                 not self.auto_pause_triggered and 
                 self.media_is_playing is not False):
-                print(f"🤖 Auto-pausing: Face absent for {self.face_absence_duration:.1f}s")
+                print(f"Auto-pausing: Face absent for {self.face_absence_duration:.1f}s")
                 self.pause_media()
                 self.auto_pause_triggered = True
         
@@ -432,13 +456,13 @@ class GestureController:
                         self.play_media()
                         self.last_play_action = current_time
                         self.thumbs_up_triggered = True
-                        gesture_text = "👍 PLAY!"
+                        gesture_text = "PLAY!"
                         self.current_gesture = "Thumbs Up - Play"
                     elif not self.thumbs_up_triggered:
-                        gesture_text = f"👍 Hold thumbs up to play..."
+                        gesture_text = "Hold thumbs up to play..."
                         self.current_gesture = "Thumbs Up detected"
                     else:
-                        gesture_text = "👍 Playing..."
+                        gesture_text = "Playing..."
                         self.current_gesture = "Thumbs Up - Active"
                 else:
                     # Gesture released - reset state
@@ -446,8 +470,11 @@ class GestureController:
                         self.thumbs_up_start_time = None
                         self.thumbs_up_triggered = False
                     
-                    # Check for open palm gesture (PAUSE) - stop sign
-                    open_palm_active = self.is_open_palm(landmarks)
+                    # Check for pause gestures: open palm OR fist
+                    is_palm = self.is_open_palm(landmarks)
+                    is_closed_fist = self.is_fist(landmarks)
+                    open_palm_active = is_palm or is_closed_fist
+                    pause_label = "Fist" if is_closed_fist else "Open Palm"
                     
                     if open_palm_active:
                         # Gesture just appeared (wasn't active before)
@@ -462,14 +489,14 @@ class GestureController:
                             self.pause_media()
                             self.last_pause_action = current_time
                             self.open_palm_triggered = True
-                            gesture_text = "🖐️ PAUSED"
-                            self.current_gesture = "Open Palm - Paused"
+                            gesture_text = "PAUSED"
+                            self.current_gesture = f"{pause_label} - Paused"
                         elif not self.open_palm_triggered:
-                            gesture_text = f"🖐️ Hold open palm to pause..."
-                            self.current_gesture = "Open Palm detected"
+                            gesture_text = f"Hold {pause_label.lower()} to pause..."
+                            self.current_gesture = f"{pause_label} detected"
                         else:
-                            gesture_text = "🖐️ Paused..."
-                            self.current_gesture = "Open Palm - Active"
+                            gesture_text = "Paused..."
+                            self.current_gesture = f"{pause_label} - Active"
                     else:
                         # Gesture released - reset state
                         if self.open_palm_was_active:
@@ -492,7 +519,7 @@ class GestureController:
                             target_volume = int(((0.95 - clamped_y) / 0.9) * 100)
                             target_volume = max(0, min(100, target_volume))
                             
-                            gesture_text = f"✌️ Volume: {target_volume}%"
+                            gesture_text = f"Volume: {target_volume}%"
                             self.current_gesture = "2 Fingers Up"
                             
                             if current_time - self.last_volume_update > self.volume_cooldown:
@@ -509,7 +536,7 @@ class GestureController:
                                     self.last_volume_update = current_time
                                     
                         else:
-                            gesture_text = f"👋 Open hand - 2 Fingers Up to control volume"
+                            gesture_text = "Hand open - show 2 fingers for vol"
                             self.current_gesture = "Open Hand"
                 
                 # Update previous state for next frame
@@ -581,14 +608,17 @@ class GestureController:
         cv2.rectangle(frame, (120, 90), (120 + 150, 105), (60, 60, 60), -1)
         cv2.rectangle(frame, (120, 90), (120 + bar_width, 105), (0, 255, 170), -1)
         
-        # Instructions at bottom
+        # Instructions at bottom with dark background for readability
         instructions = [
-            "Controls: 2 Fingers = Volume | Open Palm = Pause | Thumbs Up = Play",
+            "2 Fingers = Volume | Palm/Fist = Pause | Thumbs Up = Play",
             "Press 'Q' to quit"
         ]
+        bar_overlay = frame.copy()
+        cv2.rectangle(bar_overlay, (0, h - 55), (w, h), (20, 20, 20), -1)
+        cv2.addWeighted(bar_overlay, 0.7, frame, 0.3, 0, frame)
         for i, text in enumerate(instructions):
             cv2.putText(frame, text, (20, h - 30 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
     
     def run(self):
         """Main loop."""
@@ -597,14 +627,14 @@ class GestureController:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
         
-        print("🎮 Gesture Controller Started!")
-        print("━" * 40)
+        print("Gesture Controller Started!")
+        print("-" * 40)
         print("Controls:")
-        print("  ✌️  2 Fingers Up + Move Up/Down → Volume control")
-        print("  🖐️  Open Palm (stop sign)       → Pause")
-        print("  👍 Thumbs Up (hold)            → Play")
-        print("  👤 Face Detection              → Auto-pause when you leave")
-        print("━" * 40)
+        print("  2 Fingers Up + Move Up/Down -> Volume control")
+        print("  Open Palm / Fist            -> Pause")
+        print("  Thumbs Up (hold)            -> Play")
+        print("  Face Detection              -> Auto-pause when you leave")
+        print("-" * 40)
         print("Press 'Q' in the window to quit")
         
         try:
@@ -630,7 +660,7 @@ class GestureController:
         finally:
             cap.release()
             cv2.destroyAllWindows()
-            print("\n👋 Gesture Controller stopped.")
+            print("\nGesture Controller stopped.")
 
 
 if __name__ == "__main__":

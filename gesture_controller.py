@@ -5,10 +5,14 @@ Uses MediaPipe hand landmarks to control volume and media playback.
 
 Gestures:
 - 2 Fingers Up (index + middle): Volume control by hand height
-- Index Finger Down / Hand Down (bottom 20%): Volume down
+- Index Finger Down / Hand Down (bottom 40%): Volume down
 - Open Palm (stop sign) or Fist: Pause media
 - Thumbs up: Play media
 - Face Detection: Auto-pauses when face leaves frame (after 2 seconds)
+
+Media target routing (play/pause):
+  1. Native app (Spotify, VLC, QuickTime) if frontmost
+  2. Space key to frontmost app (browsers, any player)
 """
 
 import cv2
@@ -16,6 +20,22 @@ import mediapipe as mp
 import subprocess
 import time
 import numpy as np
+
+# AppleScript play/pause commands for native media apps.
+_NATIVE_APP_SCRIPTS = {
+    "Spotify": {
+        "play":  'tell application "Spotify" to play',
+        "pause": 'tell application "Spotify" to pause',
+    },
+    "VLC": {
+        "play":  'tell application "VLC" to play',
+        "pause": 'tell application "VLC" to pause',
+    },
+    "QuickTime Player": {
+        "play":  'tell application "QuickTime Player" to play front document',
+        "pause": 'tell application "QuickTime Player" to pause front document',
+    },
+}
 
 
 class GestureController:
@@ -73,6 +93,8 @@ class GestureController:
         self.current_gesture = "None"
         self.current_volume = self.get_current_volume()
         self.last_volume_sync = time.time()
+        self.route_status_text = ""
+        self.route_status_until = 0.0
         
     def get_current_volume(self):
         """Get current Mac volume level (0-100)."""
@@ -111,164 +133,94 @@ class GestureController:
         if system_volume != self.current_volume:
             self.current_volume = system_volume
         self.last_volume_sync = current_time
-    
-    def _is_youtube_open(self):
-        """Check if YouTube is open in Chrome or Safari."""
+
+    def _set_route_status(self, text, duration=1.8):
+        """Show short-lived playback routing feedback in the overlay."""
+        self.route_status_text = text
+        self.route_status_until = time.time() + duration
+
+    def _get_frontmost_app(self):
+        """Return the frontmost macOS app name, or None on failure."""
+        script = (
+            'tell application "System Events" to '
+            'name of first application process whose frontmost is true'
+        )
         try:
-            # Check Chrome
             result = subprocess.run(
-                ["osascript", "-e", '''
-                tell application "System Events"
-                    set chromeRunning to (name of processes) contains "Google Chrome"
-                end tell
-                if chromeRunning then
-                    tell application "Google Chrome"
-                        repeat with w in windows
-                            repeat with t in tabs of w
-                                if URL of t contains "youtube.com" then
-                                    return "chrome"
-                                end if
-                            end repeat
-                        end repeat
-                    end tell
-                end if
-                return "none"
-                '''],
-                capture_output=True,
-                text=True,
-                timeout=2
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=1
             )
-            if "chrome" in result.stdout.lower():
-                return "chrome"
-        except:
-            pass
-        
-        try:
-            # Check Safari
-            result = subprocess.run(
-                ["osascript", "-e", '''
-                tell application "System Events"
-                    set safariRunning to (name of processes) contains "Safari"
-                end tell
-                if safariRunning then
-                    tell application "Safari"
-                        repeat with w in windows
-                            repeat with t in tabs of w
-                                if URL of t contains "youtube.com" then
-                                    return "safari"
-                                end if
-                            end repeat
-                        end repeat
-                    end tell
-                end if
-                return "none"
-                '''],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if "safari" in result.stdout.lower():
-                return "safari"
-        except:
-            pass
-        
-        return None
+            if result.returncode != 0:
+                return None
+            name = result.stdout.strip()
+            return name if name else None
+        except Exception:
+            return None
     
-    def _control_youtube(self, action):
-        """Control YouTube video directly using JavaScript.
-        
-        Args:
-            action: 'play' or 'pause'
-        """
-        browser = self._is_youtube_open()
-        
-        if browser == "chrome":
-            try:
-                script = f'''
-                tell application "Google Chrome"
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            if URL of t contains "youtube.com" then
-                                try
-                                    execute t javascript "if(document.querySelector('video')) {{ document.querySelector('video').{action}(); }}"
-                                    return true
-                                end try
-                            end if
-                        end repeat
-                    end repeat
-                end tell
-                return false
-                '''
-                result = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                return "true" in result.stdout.lower()
-            except Exception:
-                return False
-        
-        elif browser == "safari":
-            try:
-                script = f'''
-                tell application "Safari"
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            if URL of t contains "youtube.com" then
-                                try
-                                    do JavaScript "if(document.querySelector('video')) {{ document.querySelector('video').{action}(); }}" in t
-                                    return true
-                                end try
-                            end if
-                        end repeat
-                    end repeat
-                end tell
-                return false
-                '''
-                result = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    timeout=2
-                )
-                return "true" in result.stdout.lower()
-            except Exception:
-                return False
-        
+    def _control_native_app(self, action):
+        """Control frontmost native media app (Spotify, VLC, QuickTime) via AppleScript."""
+        app_name = self._get_frontmost_app()
+        if app_name not in _NATIVE_APP_SCRIPTS:
+            return False
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", _NATIVE_APP_SCRIPTS[app_name][action]],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                print(f"Native app {action}: {app_name}")
+                return True
+        except Exception:
+            pass
         return False
-        
+
+    def _send_space_key(self):
+        """Send space keystroke to the frontmost app via System Events."""
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke space'],
+                capture_output=True, timeout=1
+            )
+            return True
+        except Exception:
+            return False
+
     def play_media(self):
-        """Send play command - tries YouTube first, then falls back to space key."""
-        # Only send play if we know media is paused, or if state is unknown
+        """Send play command.
+
+        Routing:
+          1. Frontmost native app (Spotify, VLC, QuickTime) via AppleScript
+          2. Space key to frontmost app (works for browsers, any media player)
+        """
         if self.media_is_playing is False or self.media_is_playing is None:
-            # Try YouTube-specific control first
-            if self._control_youtube("play"):
+            if self._control_native_app("play"):
                 self.media_is_playing = True
+                self._set_route_status("Play: native app")
                 return
-            
-            # Fallback to space bar
-            subprocess.run([
-                "osascript", "-e",
-                'tell application "System Events" to keystroke space'
-            ], capture_output=True)
+            frontmost = self._get_frontmost_app() or "unknown"
+            print(f"Play via space key -> {frontmost}")
+            self._send_space_key()
             self.media_is_playing = True
-        
+            self._set_route_status(f"Play: {frontmost}")
+
     def pause_media(self):
-        """Send pause command - tries YouTube first, then falls back to space key."""
-        # Only send pause if we know media is playing, or if state is unknown
+        """Send pause command.
+
+        Routing:
+          1. Frontmost native app (Spotify, VLC, QuickTime) via AppleScript
+          2. Space key to frontmost app (works for browsers, any media player)
+        """
         if self.media_is_playing is True or self.media_is_playing is None:
-            # Try YouTube-specific control first
-            if self._control_youtube("pause"):
+            if self._control_native_app("pause"):
                 self.media_is_playing = False
+                self._set_route_status("Pause: native app")
                 return
-            
-            # Fallback to space bar
-            subprocess.run([
-                "osascript", "-e",
-                'tell application "System Events" to keystroke space'
-            ], capture_output=True)
+            frontmost = self._get_frontmost_app() or "unknown"
+            print(f"Pause via space key -> {frontmost}")
+            self._send_space_key()
             self.media_is_playing = False
+            self._set_route_status(f"Pause: {frontmost}")
         
     def calculate_distance(self, p1, p2):
         """Calculate Euclidean distance between two landmarks."""
@@ -654,7 +606,7 @@ class GestureController:
         
         # Semi-transparent background for text
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (400, 120), (30, 30, 30), -1)
+        cv2.rectangle(overlay, (10, 10), (430, 140), (30, 30, 30), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         # Title
@@ -664,6 +616,10 @@ class GestureController:
         # Current gesture
         cv2.putText(frame, gesture_text, (20, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        if time.time() < self.route_status_until:
+            cv2.putText(frame, self.route_status_text, (20, 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 215, 255), 1)
         
         # Volume bar
         cv2.putText(frame, f"Volume: {self.current_volume}%", (20, 100),
@@ -698,10 +654,14 @@ class GestureController:
         print("Controls:")
         print("  2 Fingers Up + Move Up/Down -> Volume control")
         print("  Index Finger Down           -> Volume down")
-        print("  Hand Down (bottom of frame) -> Volume down")
+        print("  Hand Down (bottom 40%)      -> Volume down")
         print("  Open Palm / Fist            -> Pause")
         print("  Thumbs Up (hold)            -> Play")
         print("  Face Detection              -> Auto-pause when you leave")
+        print("")
+        print("Play/Pause targets:")
+        print("  1. Native app (Spotify, VLC, QuickTime) if frontmost")
+        print("  2. Space key to frontmost app (browsers, any player)")
         print("-" * 40)
         print("Press 'Q' in the window to quit")
         

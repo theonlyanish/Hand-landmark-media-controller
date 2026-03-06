@@ -1,74 +1,97 @@
-# Hand Gesture Media Controller
+# Hand Landmark Media Controller
 
-Control your Mac's volume and media playback using hand gestures detected via your webcam. Built with MediaPipe hand landmark detection.
+Webcam-based hand gesture controls for media playback and system volume on macOS.
 
-## Features
+This project is an MVP focused on reliable, low-friction controls while you are at your desk.
 
-| Gesture | Action |
-|---------|--------|
-| 🤏 **Pinch + Move** | Control volume (move hand up/down while pinching) |
-| ✊ **Fist** (hold) | Pause media |
-| 👆 **Double Tap** (towards camera) | Play media |
+## What It Does
+
+- Detects hand and face landmarks with MediaPipe.
+- Controls macOS output volume and mute.
+- Sends play/pause commands to media targets.
+- Auto-pauses when your face leaves the frame for ~2 seconds.
+- Shows a live camera overlay with gesture, routing, and volume state.
+
+## Gesture Controls
+
+| Gesture | Action | Notes |
+|---|---|---|
+| ✌️ 2 fingers up | Volume map by hand height | Raise hand to increase volume, lower to decrease |
+| 👇 Index finger down | Volume down (step) | Decreases volume in small steps |
+| 🖐️ Hand facing down (low in frame) | Volume down (step) | Hand must be low enough in frame |
+| ✊ Fist (hold ~0.4s) | Toggle mute | Works as mute/unmute toggle |
+| ✋ Open palm (hold ~0.5s) | Pause | Requires stable open-palm hold |
+| 👍 Thumbs up (hold ~0.3s) | Play | Requires stable thumbs-up hold |
+| Face missing for ~2s | Auto-pause | Triggered when face is not detected |
+
+## Media Routing Behavior
+
+Play/pause uses this order:
+
+1. Frontmost native app if supported (`Spotify`, `VLC`, `QuickTime Player`)
+2. Space key to the current frontmost app
+
+Routing feedback is shown in the overlay so you can see where commands were sent.
 
 ## Installation
 
-1. **Create a virtual environment** (recommended):
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+1. Create a virtual environment:
 
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 
-3. **Grant camera permissions**:
-   - Go to **System Preferences → Security & Privacy → Camera**
-   - Enable camera access for Terminal (or your IDE)
+2. Install dependencies:
 
-## Usage
+```bash
+pip install -r requirements.txt
+```
+
+3. Grant camera access:
+
+- Open `System Settings -> Privacy & Security -> Camera`
+- Allow camera access for Terminal (or the app running Python)
+
+## Run
 
 ```bash
 python gesture_controller.py
 ```
 
-- A window will open showing your webcam feed with hand tracking overlay
-- Use the gestures listed above to control media
-- Press **Q** to quit
-
-## How It Works
-
-- **Volume Control**: Pinch your thumb and index finger together, then move your hand up (volume up) or down (volume down)
-- **Pause**: Make a fist and hold for ~0.3 seconds
-- **Play**: Push your hand towards the camera twice quickly (double tap motion)
+- Press `Q` to quit.
+- Keep one hand clearly visible for best tracking.
+- Use steady holds for play/pause/mute gestures.
 
 ## Requirements
 
-- macOS (uses `osascript` for system control)
+- macOS (uses `osascript`)
 - Python 3.8+
 - Webcam
 
 ## Tech Stack
 
-- **MediaPipe** - Hand landmark detection
-- **OpenCV** - Webcam capture and display
-- **osascript** - Mac system volume/media control
+- MediaPipe
+- OpenCV
+- AppleScript via `osascript`
 
 ## Troubleshooting
 
-**Camera not working?**
-- Ensure camera permissions are granted in System Preferences
-- Try closing other apps that might be using the camera
+### Camera does not start
 
-**Volume control not working?**
-- Make sure no other app has exclusive audio control
-- Check that system volume isn't muted
+- Confirm camera permissions are granted.
+- Close other apps that may be using the webcam.
 
-**Gestures not detected?**
-- Ensure good lighting
-- Keep your hand within the camera frame
-- Avoid cluttered backgrounds
+### Gestures are inconsistent
+
+- Improve lighting and keep a plain background.
+- Keep your full hand in frame.
+- Hold action gestures for the required duration.
+
+### Volume UI looks wrong
+
+- External changes (media keys, other apps) are polled and should resync quickly.
+- If needed, pause gestures for a second to let state settle.
 
 ## License
 
